@@ -30,6 +30,7 @@
 
 set -euo pipefail
 
+PERF_PATH="/usr/lib/linux-tools/6.8.0-87-generic/perf"  # Adjust as needed
 PYTHON_BIN=${PYTHON_BIN:-python3}
 RESULTS_DIR=${RESULTS_DIR:-results/dse}
 RAW_DIR="$RESULTS_DIR/raw"
@@ -43,26 +44,26 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 TRAIN_NUM_WORKERS=${TRAIN_NUM_WORKERS:-2}
 TRAIN_EXTRA_ARGS=${TRAIN_EXTRA_ARGS:-}
 
-INFER_BATCH_SIZE=${INFER_BATCH_SIZE:-128}
-INFER_ITERATIONS=${INFER_ITERATIONS:-2}
-INFER_NUM_WORKERS=${INFER_NUM_WORKERS:-2}
+INFER_BATCH_SIZE=${INFER_BATCH_SIZE:-32}
+INFER_ITERATIONS=${INFER_ITERATIONS:-25}
+INFER_NUM_WORKERS=${INFER_NUM_WORKERS:-1}
 INFER_EXTRA_ARGS=${INFER_EXTRA_ARGS:-}
 
 # Kernel size sweep for DSE
 # Set to 1 to enable kernel size exploration, 0 to use fixed FIRST_KERNEL
-KERNEL_SIZE_SWEEP=${KERNEL_SIZE_SWEEP:-1}
+KERNEL_SIZE_SWEEP=${KERNEL_SIZE_SWEEP:-0}
 # First kernel sizes to test (space-separated list)
 # These determine the starting kernel size for the progression
-FIRST_KERNEL_SIZES=${FIRST_KERNEL_SIZES:-"11 7"}
+FIRST_KERNEL_SIZES=${FIRST_KERNEL_SIZES:-"3 7"}
 
 # Default first kernel size (used when KERNEL_SIZE_SWEEP=0)
-FIRST_KERNEL=${FIRST_KERNEL:-11}
+FIRST_KERNEL=${FIRST_KERNEL:-3}
 
-# Evaluation-only mode (DEPRECATED: not supported in kernel size sweep mode)
+# Evaluation-only mode
 # Set to 1 to skip training and only run evaluation on pre-trained models
-EVAL_ONLY=${EVAL_ONLY:-0}
+EVAL_ONLY=${EVAL_ONLY:-1}
 # Note: EVAL_ONLY mode is not compatible with kernel size exploration
-PRETRAINED_MODELS=${PRETRAINED_MODELS:-""}
+PRETRAINED_MODELS=${PRETRAINED_MODELS:-"results/convolutional_3_45.pth results/fft_3_45.pth results/torch_3_45.pth"}
 
 # Training mode selection:
 # - If MATCH_BASELINE_ACCURACY=1: Train AlexNet for TRAIN_EPOCHS, then train FFT models until they match AlexNet's Top-1 accuracy
@@ -75,7 +76,7 @@ TARGET_TOP1=""
 DATA_ROOT=${DATA_ROOT:-dataset}
 PROFILE_LAYERS=${PROFILE_LAYERS:-0}
 
-MONITOR_MODE=${MONITOR_MODE:-gpu}
+MONITOR_MODE=${MONITOR_MODE:-cpu}
 # CPU monitoring settings
 # Hardware monitoring mode: "gpu" or "cpu"
 PERF_REPETITIONS=${PERF_REPETITIONS:-1}
@@ -89,7 +90,7 @@ if [[ "$MONITOR_MODE" == "gpu" ]]; then
         exit 1
     }
 elif [[ "$MONITOR_MODE" == "cpu" ]]; then
-    command -v perf >/dev/null || {
+    command -v $PERF_PATH >/dev/null || {
         echo "Error: perf not found in PATH." >&2
         echo "Install with: sudo apt-get install linux-tools-common linux-tools-generic" >&2
         exit 1
@@ -122,7 +123,7 @@ elif [[ "$MONITOR_MODE" == "cpu" ]]; then
     fi
     
     # Verify that power/energy-pkg/ is available
-    if ! perf list 2>/dev/null | grep -q "power/energy-pkg/"; then
+    if ! $PERF_PATH list 2>/dev/null | grep "power/energy-pkg/"; then
         echo "Error: power/energy-pkg/ counter not available." >&2
         echo "" >&2
         echo "Possible causes:" >&2
@@ -311,21 +312,10 @@ run_with_metrics_cpu() {
     local -a cmd=("$@")
 
     local metrics_base="${label}_metrics"
-    local log_base="${label}"
+    local log_base="${label}_${MONITOR_MODE}"
     local metrics_file="$RAW_DIR/${metrics_base}.csv"
     local log_file="$RAW_DIR/${log_base}.log"
     local perf_file="$RAW_DIR/${label}_perf.txt"
-    local suffix=1
-    while [[ -e "$metrics_file" ]]; do
-        metrics_file="$RAW_DIR/${metrics_base}_${suffix}.csv"
-        suffix=$((suffix + 1))
-    done
-
-    local log_suffix=1
-    while [[ -e "$log_file" ]]; do
-        log_file="$RAW_DIR/${log_base}_${log_suffix}.log"
-        log_suffix=$((log_suffix + 1))
-    done
 
     local cmd_str
     printf -v cmd_str '%q ' "${cmd[@]}"
@@ -337,7 +327,7 @@ run_with_metrics_cpu() {
     local status="OK"
 
     # Run command with perf stat
-    perf stat -r "$PERF_REPETITIONS" -e power/energy-pkg/ "${cmd[@]}" > "$log_file" 2> "$perf_file"
+    $PERF_PATH stat -r "$PERF_REPETITIONS" -e power/energy-pkg/ "${cmd[@]}" > "$log_file" 2> "$perf_file"
     local exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -386,20 +376,9 @@ run_with_metrics_gpu() {
     local -a cmd=("$@")
 
     local metrics_base="${label}_metrics"
-    local log_base="${label}"
+    local log_base="${label}_${MONITOR_MODE}"
     local metrics_file="$RAW_DIR/${metrics_base}.csv"
     local log_file="$RAW_DIR/${log_base}.log"
-    local suffix=1
-    while [[ -e "$metrics_file" ]]; do
-        metrics_file="$RAW_DIR/${metrics_base}_${suffix}.csv"
-        suffix=$((suffix + 1))
-    done
-
-    local log_suffix=1
-    while [[ -e "$log_file" ]]; do
-        log_file="$RAW_DIR/${log_base}_${log_suffix}.log"
-        log_suffix=$((log_suffix + 1))
-    done
 
     printf "rel_ms,power_W,util_pct,mem_used_MiB,mem_total_MiB,temp_C\n" > "$metrics_file"
 
@@ -521,7 +500,7 @@ run_inference_eval() {
     eval_cmd+=("${INFER_EXTRA_ARGS_ARRAY[@]}")
     eval_cmd+=("${PROFILE_ARGS[@]}")
 
-    inference_label="inference_${arch}_k${kernel_size}_bs${INFER_BATCH_SIZE}_w${INFER_NUM_WORKERS}"
+    inference_label="inference_${arch}_k${kernel_size}_bs${INFER_BATCH_SIZE}_w${INFER_NUM_WORKERS}_i${INFER_ITERATIONS}"
     if ! run_with_metrics "inference" "$arch" "$inference_label" "$INFER_NUM_WORKERS" "${eval_cmd[@]}"; then
         overall_status=1
     fi
@@ -530,8 +509,29 @@ run_inference_eval() {
 if [[ "$EVAL_ONLY" == "1" ]]; then
     # EVALUATION-ONLY MODE: Skip training, evaluate pre-trained models
     echo "=== MODE: Evaluation Only ==="
-    echo "Error: EVAL_ONLY mode not supported in kernel size sweep. Please train models." >&2
-    exit 1
+    echo "=== Evaluating pre-trained models: ${PRETRAINED_MODELS} ==="
+    
+    # Parse and evaluate each pre-trained model
+    for model_path in $PRETRAINED_MODELS; do
+        if [[ ! -f "$model_path" ]]; then
+            echo "Warning: Pre-trained model not found: $model_path. Skipping." >&2
+            overall_status=1
+            continue
+        fi
+        
+        # Extract arch and kernel_size from filename (format: results/<arch>_<kernel>_<epochs>.pth)
+        model_name=$(basename "$model_path" .pth)
+        IFS='_' read -r arch kernel_size epochs <<< "$model_name"
+        
+        if [[ -z "$arch" || -z "$kernel_size" || -z "$epochs" ]]; then
+            echo "Warning: Could not parse arch/kernel from $model_path. Expected format: <arch>_<kernel>_<epochs>.pth. Skipping." >&2
+            overall_status=1
+            continue
+        fi
+        
+        # Evaluate the model
+        run_inference_eval "$arch" "$model_path" "$kernel_size"
+    done
     
 elif [[ "$MATCH_BASELINE_ACCURACY" == "1" ]]; then
     echo "=== MODE: Match Baseline Accuracy ==="
