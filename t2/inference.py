@@ -21,8 +21,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for inference")
     parser.add_argument("--data-root", type=str, default="dataset", help="Root directory containing CIFAR-100 data (expects 'cifar-100-python' inside)")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of DataLoader workers")
-    parser.add_argument("--profile-layers", action="store_true",
-                        help="Measure per-layer forward time, export CSV, and plot pie chart")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,21 +32,14 @@ def main():
         "fft": FFTAlexNet,
         "torch": TorchAlexNet
     }
-    model = model_classes[args.arch](num_classes=100).to(device)
-    model.load_state_dict(torch.load(args.model, map_location=device))
+    
+    # Load checkpoint
+    checkpoint = torch.load(args.model, map_location=device)
+    first_kernel = checkpoint.get("first_kernel", 11)  # default to 11 if not saved
+    
+    model = model_classes[args.arch](num_classes=100, first_kernel=first_kernel).to(device)
+    model.load_state_dict(checkpoint["model_state"])
     model.eval()
-
-    profiler = None
-    if args.profile_layers:
-        from profiling_utils import (
-            LayerTimer,
-            plot_layer_group_pie,
-            plot_layer_times_pie,
-            save_layer_times,
-        )
-
-        profiler = LayerTimer(model, device)
-        profiler.reset()
 
     # Build CIFAR-100 test dataset and DataLoader
     normalize = transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761))
@@ -111,26 +102,6 @@ def main():
         top1 = 100.0 * top1_correct / len(test_dataset)
         top5 = 100.0 * top5_correct / len(test_dataset)
         print(f"Top-1 Accuracy: {top1:.2f}% | Top-5 Accuracy: {top5:.2f}%")
-
-    if profiler is not None:
-        summary = profiler.summary()
-        output_dir = Path("results/timing")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Extract kernel size and epochs from model filename (format: <topology>_<kernel_size>_<epochs>.pth)
-        model_name = Path(args.model).stem
-        parts = model_name.split('_')
-        kernel_size = parts[1] if len(parts) > 1 else 'unknown'
-        epochs = parts[2] if len(parts) > 2 else 'unknown'
-        
-        csv_path = output_dir / f"inference_layers_{args.arch}_k{kernel_size}_e{epochs}.csv"epochs}.csv"
-        png_path = output_dir / f"inference_layers_{args.arch}_k{kernel_size}_e{epochs}.png"
-        component_png_path = output_dir / f"inference_layers_component_{args.arch}_k{kernel_size}_e{epochs}.png"
-        save_layer_times(summary, csv_path)
-        plot_layer_times_pie(summary, png_path, title=f"Average Timing per Layer in {args.arch} (Inference, k{kernel_size}, e{epochs})")
-        plot_layer_group_pie(summary, component_png_path, title=f"Average Timing for Features vs Classifier ({args.arch}, Inference, k{kernel_size}, e{epochs})")
-        profiler.remove()
-        print(f"Layer timing exported to {csv_path}, {png_path}, and {component_png_path}.")
 
 
 if __name__ == "__main__":
