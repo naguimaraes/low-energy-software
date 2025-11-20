@@ -117,8 +117,6 @@ class ExplicitConv2d(nn.Module):
         w = self.weight.view(self.out_channels, -1)
         # matmul: (B, out, L)
         out = w.unsqueeze(0).matmul(patches)  # (1, out, in*kh*kw) x (B, in*kh*kw, L) -> (B, out, L)
-        out = out.squeeze(0) if out.size(0) == 1 else out  # safety for shapes
-        out = out.permute(0, 1, 2)  # (B, out, L)
         # fold back to (B, out, H_out, W_out)
         # compute output H/W
         H_p = x_p.size(2)
@@ -201,7 +199,9 @@ class FFTConv2d(nn.Module):
         Xf = torch.fft.rfft2(x_padded, s=(fft_h, fft_w))
 
         # FFT of filters: (Cout, Cin, Hf, Wf_half)
-        Wf = torch.fft.rfft2(self.weight, s=(fft_h, fft_w))
+        # Flip kernel for convolution vs cross-correlation (PyTorch conv2d is cross-correlation)
+        weight_flipped = torch.flip(self.weight, dims=[-2, -1])
+        Wf = torch.fft.rfft2(weight_flipped, s=(fft_h, fft_w))
 
         # Multiply and sum over input channels: Yf[b, o, h, w] = sum_f Xf[b,f,h,w] * Wf[o,f,h,w]
         # Use einsum for batched multiplication
@@ -210,10 +210,18 @@ class FFTConv2d(nn.Module):
         # Inverse fft back to spatial domain -> (B, Cout, fft_h, fft_w)
         y = torch.fft.irfft2(Yf, s=(fft_h, fft_w))
 
-        # compute output spatial dims with stride
+        # compute output spatial dims
         out_h = (H + 2*pad - self.kH) // self.stride + 1
         out_w = (W + 2*pad - self.kW) // self.stride + 1
-        y = y[:, :, :out_h * self.stride:self.stride, :out_w * self.stride:self.stride]
+
+        # For padded convolution, crop the central valid region
+        start_h = (fft_h - out_h) // 2
+        start_w = (fft_w - out_w) // 2
+        y = y[:, :, start_h : start_h + out_h, start_w : start_w + out_w]
+
+        # Apply stride if >1 (though in AlexNet convs are stride=1)
+        if self.stride > 1:
+            y = y[:, :, ::self.stride, ::self.stride]
 
         if self.bias is not None:
             y = y + self.bias.view(1, -1, 1, 1)
